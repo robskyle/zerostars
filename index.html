@@ -1309,8 +1309,14 @@ async function submitRatingToLocation(location, ratingData) {
     } catch(e) { console.warn('Rating audit write failed:', e); }
 
   } catch(e) {
-    alert('Failed to submit your rating. Please try again.');
-    console.error(e);
+    console.error('Rating submission failed:', e);
+    let msg = 'Failed to submit your rating. Please try again.';
+    if (e && e.code === 'PERMISSION_DENIED') {
+      msg = 'Permission denied by the database. Your Firebase rules may not allow this write yet — see Firebase_Setup_Guide.txt, the "$pinKey/ratings/$uid" rule under the pins node.';
+    } else if (e && e.message) {
+      msg = 'Failed to submit your rating: ' + e.message;
+    }
+    alert(msg);
   }
 }
 
@@ -2691,6 +2697,19 @@ function initAuth() {
             const expiry = profile.expires_at.toDate ? profile.expires_at.toDate() : new Date(profile.expires_at);
             if (expiry < new Date()) profile.status = 'expired';
           }
+          // Normalize is_superuser — handles real booleans (true/false) AND
+          // the common manual-Firestore-console mistake of typing the field
+          // in as a STRING "true"/"false", which JavaScript would otherwise
+          // treat as truthy in BOTH cases (the string "false" is truthy!).
+          const rawSuperuser = profile.is_superuser;
+          const isSuperuser = rawSuperuser === true || rawSuperuser === 'true';
+          console.log('[ZeroStarRating] Login profile loaded:', {
+            uid: fbUser.uid,
+            username: profile.username,
+            is_superuser_raw: rawSuperuser,
+            is_superuser_type: typeof rawSuperuser,
+            is_superuser_resolved: isSuperuser
+          });
           setCurrentUser({
             uid:          fbUser.uid,
             username:     profile.username || fbUser.email,
@@ -2698,7 +2717,7 @@ function initAuth() {
             status:       profile.status   || 'active',
             plan:         profile.plan     || 'annual',
             expires_at:   profile.expires_at || null,
-            is_superuser: profile.is_superuser || false
+            is_superuser: isSuperuser
           });
         } else {
           // Auth user exists but no Firestore profile — treat as guest
@@ -2759,6 +2778,7 @@ function setCurrentUser(user) {
 
   // Superusers get full developer/admin access automatically through the
   // normal login — there is no separate developer login anymore.
+  console.log('[ZeroStarRating] setCurrentUser: is_superuser =', user.is_superuser, '— dev panel will', user.is_superuser ? 'OPEN' : 'stay closed');
   if (user.is_superuser) {
     devMode = true;
     document.getElementById('devPanel').classList.add('show');
@@ -2819,27 +2839,39 @@ function selectPlan(plan) {
 
 // ── Login (Firebase Auth) ──────────────────────────────────────────────────
 async function doLogin() {
-  const username = document.getElementById('loginUser').value.trim();
+  const usernameOrEmail = document.getElementById('loginUser').value.trim();
   const password = document.getElementById('loginPass').value;
   const err = document.getElementById('loginErr');
   err.classList.remove('show');
-  if (!username || !password) { err.textContent='Enter email and password'; err.classList.add('show'); return; }
+  if (!usernameOrEmail || !password) { err.textContent='Enter your username/email and password'; err.classList.add('show'); return; }
 
   const btn = document.querySelector('#authLoginTab .auth-btn');
   if (btn) { btn.disabled=true; btn.textContent='Logging in\u2026'; }
 
   try {
-    await fbAuth.signInWithEmailAndPassword(username, password);
+    // Firebase Auth only accepts an actual email address — if what was
+    // typed doesn't look like one, look up the matching account's email
+    // via the public username→email lookup collection first.
+    let email = usernameOrEmail;
+    if (!email.includes('@')) {
+      const doc = await fbStore.collection('usernames').doc(usernameOrEmail).get();
+      if (!doc.exists || !doc.data().email) {
+        throw { code: 'auth/user-not-found' };
+      }
+      email = doc.data().email;
+    }
+
+    await fbAuth.signInWithEmailAndPassword(email, password);
     // onAuthStateChanged handles the rest
   } catch(e) {
     if (btn) { btn.disabled=false; btn.innerHTML='<i class="ti ti-login"></i> Login'; }
     const msg = {
-      'auth/user-not-found':   'No account with that email.',
+      'auth/user-not-found':   'No account with that username or email.',
       'auth/wrong-password':   'Incorrect password.',
       'auth/invalid-email':    'Invalid email address.',
       'auth/too-many-requests':'Too many attempts. Try again later.',
-      'auth/invalid-credential': 'Invalid email or password.'
-    }[e.code] || 'Login failed. Check your email and password.';
+      'auth/invalid-credential': 'Invalid username/email or password.'
+    }[e.code] || 'Login failed. Check your username/email and password.';
     err.textContent = msg; err.classList.add('show');
   } finally {
     if (btn) { btn.disabled=false; btn.innerHTML='<i class="ti ti-login"></i> Login'; }
@@ -2859,10 +2891,30 @@ async function doRegister() {
 
   if (!username || !email || !password) { err.textContent='All fields required'; err.classList.add('show'); return; }
   if (password.length < 8) { err.textContent='Password must be at least 8 characters'; err.classList.add('show'); return; }
+  // Usernames become Firestore document IDs for the login lookup table,
+  // so they can't contain '/', start/end with '.', or be a reserved name.
+  // Keep this simple and safe: letters, numbers, underscore, hyphen only.
+  if (!/^[a-zA-Z0-9_-]{2,30}$/.test(username)) {
+    err.textContent = 'Username can only contain letters, numbers, underscores, and hyphens (2-30 characters).';
+    err.classList.add('show');
+    return;
+  }
 
   btn.disabled=true; btn.textContent='Creating account\u2026';
 
   try {
+    // Check username isn't already taken BEFORE creating the auth account —
+    // otherwise two people could register the same username and the second
+    // signup would silently overwrite the first user's login lookup entry,
+    // breaking their ability to log in by username.
+    const existingUsername = await fbStore.collection('usernames').doc(username).get();
+    if (existingUsername.exists) {
+      btn.disabled=false; btn.innerHTML='<i class="ti ti-user-plus"></i> Create Account';
+      err.textContent = 'That username is already taken. Please choose another.';
+      err.classList.add('show');
+      return;
+    }
+
     // Create Firebase Auth user
     const cred = await fbAuth.createUserWithEmailAndPassword(email, password);
     const uid  = cred.user.uid;
@@ -2885,6 +2937,15 @@ async function doRegister() {
       signup_ip:    await getClientIP(),
       created_at:   firebase.firestore.FieldValue.serverTimestamp()
     });
+
+    // Minimal public lookup entry so this user can log in with their
+    // username instead of their email (Firebase Auth itself only accepts
+    // emails — see doLogin). Contains nothing beyond username→email→uid.
+    try {
+      await fbStore.collection('usernames').doc(username).set({ email, uid });
+    } catch(e) {
+      console.warn('Username lookup entry failed to save (login by email will still work):', e);
+    }
 
     btn.disabled=false; btn.innerHTML='<i class="ti ti-user-plus"></i> Create Account';
 
